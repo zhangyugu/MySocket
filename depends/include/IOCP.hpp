@@ -1,7 +1,7 @@
 #pragma once
 #ifndef IOCP___HPP
 #define IOCP___HPP
-// winsock 2 的头文件和库
+#ifdef _WIN32
 #include <SockContext.h>
 #include <MSWSock.h>
 #include <assert.h>
@@ -27,6 +27,33 @@ enum class REQUEST_TYPE : char
 	RECV,                       // 标志投递的是接收操作
 	NEW_SEND, 					//
 	INVALID                        // 用于初始化，无意义
+};
+
+enum class IO_TYPE : char {
+	ACCEPT,
+	RECR,
+	SEND,
+	INVALID
+};
+
+#define IO_DATA_BUFF_SIZE 1024
+struct IO_DATA_BASE
+{
+	//重叠体
+	WSAOVERLAPPED overlapped;
+	SOCKET sockfd;
+	//数据缓冲区
+	char buffer[IO_DATA_BUFF_SIZE];
+	int length;
+	//操作类型
+	IO_TYPE type;
+};
+
+struct IO_EVENT 
+{
+	IO_DATA_BASE* pIoData;
+	SOCKET socket = INVALID_SOCKET;
+	DWORD btesTrans = 0;
 };
 
 struct Event : public WSAOVERLAPPED
@@ -57,8 +84,9 @@ private:
 	std::vector<std::unique_ptr<std::thread>> _arrThread;
 protected:
 	HANDLE _PortHandle{};
-	char acceptBuf[64]{};
+	char acceptBuf[1024]{};
 	EventPtr _Listener;
+	SOCKET _ListenSocket  = INVALID_SOCKET;
 	LPFN_ACCEPTEX  _AcceptEx{};  // AcceptEx 和 GetAcceptExSockaddrs 的函数指针，用于调用这两个扩展函数
 	LPFN_GETACCEPTEXSOCKADDRS _GetAcceptExSockAddrs{};
 	ACCEPT_BACK _acceptCall{nullptr};
@@ -85,7 +113,7 @@ public:
 			return false;
 		_acceptCall = acceptCall;
 		// 需要使用重叠IO，必须得使用WSASocket来建立Socket，才可以支持重叠IO操作
-		_Listener->_socket = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
+		_Listener->_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 		if (_Listener->_socket == INVALID_SOCKET) return 0;
 
 
@@ -179,6 +207,179 @@ public:
 		}
 	}
 
+	bool create()
+	{
+		if (!_PortHandle)
+		{
+			// 建立监听完成端口
+			if (!(_PortHandle = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, NULL, NULL)))
+				return false;
+		}
+		return true;
+	}
+
+	void destory()
+	{
+		if (_PortHandle)
+		{
+			CloseHandle(_PortHandle);
+			_PortHandle = nullptr;
+		}		
+	}
+
+	bool reg(SOCKET sockfd)
+	{
+		if (!CreateIoCompletionPort((HANDLE)sockfd, _PortHandle, (ULONG_PTR)sockfd, NULL))
+		{
+			printf("socket<%d>关联完成端口失败, ERROR: %d\n", sockfd, GetLastError());
+			return false;
+		}
+		return true;
+	}
+
+	void loadFunction(SOCKET listenSocket)
+	{
+		if (_ListenSocket != INVALID_SOCKET)
+		{	
+			printf("ERROR: loaded\n");
+			return;
+		}
+		_Listener->_socket = listenSocket;
+
+		if (!_AcceptEx)
+		{
+			//获取acceptEx函数地址
+			DWORD dwBytes = 0;
+			GUID guidAcceptEx = WSAID_ACCEPTEX;
+			if (SOCKET_ERROR == WSAIoctl(_ListenSocket, SIO_GET_EXTENSION_FUNCTION_POINTER, &guidAcceptEx,
+				sizeof(guidAcceptEx), &_AcceptEx, sizeof(_AcceptEx), &dwBytes, nullptr, nullptr))
+				throw "获取acceptEx函数地址失败";
+		}
+		if (!_GetAcceptExSockAddrs)
+		{
+			DWORD dwBytes = 0;
+			// 获取GetAcceptExSockAddrs函数指针，也是同理
+			GUID guidGetaddrs = WSAID_GETACCEPTEXSOCKADDRS;
+			if (SOCKET_ERROR == WSAIoctl(_ListenSocket, SIO_GET_EXTENSION_FUNCTION_POINTER, &guidGetaddrs,
+				sizeof(guidGetaddrs), &_GetAcceptExSockAddrs, sizeof(_GetAcceptExSockAddrs), &dwBytes, nullptr, nullptr))
+				throw "获取GetAcceptExSockAddrs函数地址失败";
+		}
+
+	}
+	bool postAccept(IO_DATA_BASE *pIO_DATA)
+	{
+		if (!_AcceptEx)
+		{
+			printf("error, postAccept _AcceptEx is null\n");
+			return false;
+		}
+		pIO_DATA->type = IO_TYPE::ACCEPT;
+		pIO_DATA->sockfd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+		if (INVALID_SOCKET == _Listener->_sockAccept)
+		{
+			printf("创建用于Accept的Socket失败！错误代码: %d\n", WSAGetLastError());
+			return false;
+		}
+		// 投递AcceptEx
+		if (FALSE == _AcceptEx(
+			_ListenSocket,
+			pIO_DATA->sockfd,
+			pIO_DATA->buffer,					//存放客户端地址信息和消息的缓冲区
+			0,							//接受第一个消息的长度(缓冲大小 - (sizeof(SOCKADDR_IN) + 16) * 2)   为零只建立连接
+			sizeof(SOCKADDR_IN) + 16,
+			sizeof(SOCKADDR_IN) + 16,
+			nullptr,					//同步模式下接收到的字节数
+			&pIO_DATA->overlapped))			//
+		{
+			int err = WSAGetLastError();
+			if (WSA_IO_PENDING != err)
+			{
+				printf("投递 AcceptEx 请求失败，错误代码: %d\n", err);
+				return false;
+			}
+		}
+		return true;
+
+	}
+
+	bool postRecv(IO_DATA_BASE *pIO_DATA)
+	{
+		pIO_DATA->type = IO_TYPE::RECR;
+		WSABUF wsbuf = {};
+		wsbuf.buf = pIO_DATA->buffer;
+		wsbuf.len = DATA_BUFF_SIZE;
+		DWORD flags = 0;
+		int nBytesRecv = WSARecv(pIO_DATA->sockfd,		//已连接完成套接字
+								&wsbuf,					//缓冲区数组
+								1,						//缓冲区数组大小
+								nullptr,				//同步模式下的处理字节数
+								&flags,					//标志
+								&pIO_DATA->overlapped,	//重叠体
+								nullptr);				//同步回调
+		// 如果返回值错误，并且错误的代码并非是Pending的话，那就说明这个重叠请求失败了
+		if ((SOCKET_ERROR == nBytesRecv) && (WSA_IO_PENDING != (nBytesRecv = WSAGetLastError())))//
+		{
+			if (WSAEFAULT == nBytesRecv)
+				printf("投递一个WSARecv失败 系统在尝试使用调用的指针参数时检测到无效的指针地址\n");
+			else
+				printf("投递第一个WSARecv失败 Error: %d\n", nBytesRecv);
+			return false;
+		}
+		return true;
+	}
+
+	bool postSend(IO_DATA_BASE *pIO_DATA)
+	{
+		pIO_DATA->type = IO_TYPE::SEND;
+		WSABUF wsbuf = {};
+		wsbuf.buf = pIO_DATA->buffer;
+		wsbuf.len = DATA_BUFF_SIZE;
+		DWORD flags = 0;
+		int nBytesRecv = WSASend(pIO_DATA->sockfd,		//已连接完成套接字
+			&wsbuf,					//缓冲区数组
+			1,						//缓冲区数组大小
+			nullptr,				//同步模式下的处理字节数
+			flags,					//标志
+			&pIO_DATA->overlapped,	//重叠体
+			nullptr);				//同步回调
+		// 如果返回值错误，并且错误的代码并非是Pending的话，那就说明这个重叠请求失败了
+		if ((SOCKET_ERROR == nBytesRecv) && (WSA_IO_PENDING != (nBytesRecv = WSAGetLastError())))//
+		{
+			if (WSAEFAULT == nBytesRecv)
+				printf("投递一个WSARecv失败 系统在尝试使用调用的指针参数时检测到无效的指针地址\n");
+			else
+				printf("投递第一个WSARecv失败 Error: %d\n", nBytesRecv);
+			return false;
+		}
+		return true;
+	}
+
+	//等待消息完成, 获取一个事件
+	int wait(IO_EVENT & ioEvent, int time)
+	{
+		memset(&ioEvent, 0, sizeof(IO_EVENT));
+		if (!GetQueuedCompletionStatus(_PortHandle, 
+										&ioEvent.btesTrans, 
+										(PULONG_PTR)&ioEvent.socket, 
+										(LPOVERLAPPED*)&ioEvent.pIoData, 
+										time))
+		{
+			int err = GetLastError();
+			if (WAIT_TIMEOUT == err)
+			{
+				return 0;
+			}
+			if (ERROR_NETNAME_DELETED == err)
+			{
+				return 1;
+			}
+			printf("GetQueuedCompletionStatus failed with error %d\n", err);
+			return -1;
+		}
+
+		return 1;
+	}
+
 	//添加到端口
 	bool AddSocket(Event *sockevent)// 添加套接字
 	{
@@ -193,11 +394,9 @@ public:
 	{
 		assert(INVALID_SOCKET != _Listener->_socket);
 
-		// 准备参数
-		DWORD dwBytes = 0;
 
 		// 为以后新连入的客户端先准备好Socket( 这个是与传统accept最大的区别 ) 
-		_Listener->_sockAccept = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
+		_Listener->_sockAccept = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 		if (INVALID_SOCKET == _Listener->_sockAccept)
 		{
 			printf("创建用于Accept的Socket失败！错误代码: %d\n", WSAGetLastError());
@@ -208,16 +407,17 @@ public:
 		if (FALSE == _AcceptEx(
 			_Listener->_socket,
 			_Listener->_sockAccept,
-			acceptBuf,
-			0,
+			acceptBuf,					//存放客户端地址信息和消息的缓冲区
+			0,							//接受第一个消息的长度(缓冲大小 - (sizeof(SOCKADDR_IN) + 16) * 2)   为零只建立连接
 			sizeof(SOCKADDR_IN) + 16,
 			sizeof(SOCKADDR_IN) + 16,
-			&dwBytes,
-			_Listener.get()))
+			nullptr,					//同步模式下接收到的字节数
+			_Listener.get()))			//
 		{
-			if (WSA_IO_PENDING != WSAGetLastError())
+			int err = WSAGetLastError();
+			if (WSA_IO_PENDING != err)
 			{
-				printf("投递 AcceptEx 请求失败，错误代码: %d\n", WSAGetLastError());
+				printf("投递 AcceptEx 请求失败，错误代码: %d\n", err);
 				return false;
 			}
 		}
@@ -333,21 +533,21 @@ protected:
 private:
 	//线程运行
 	void Run()
-	{
-		OVERLAPPED           *pOverlapped = NULL;
+	{		
 		DWORD                dwBytesTransfered = 0;
 		ULONG_PTR			 KeyValue;//注册是或者PostQueuedCompletionStatus发送过来的键值
+		LPOVERLAPPED         pOverlapped = NULL;
 
 		int thread = ++count2;
 		// 循环处理请求，知道接收到Shutdown信息为止
 		while (WAIT_OBJECT_0 != WaitForSingleObject(_hShutdownEvent, 0))
 		{
 			BOOL bReturn = GetQueuedCompletionStatus(
-				_PortHandle,
-				&dwBytesTransfered,
-				&KeyValue,
-				&pOverlapped,
-				INFINITE);
+				_PortHandle,			//完成端口句柄
+				&dwBytesTransfered,		//实际处理的数据字节数
+				&KeyValue,				//加入完成端口时传递的键值
+				&pOverlapped,			//加入完成端口时传递的重叠体
+				INFINITE);				//等待时间, INFINITE无限等待
 
 			
 			// 如果收到的是退出标志，则直接退出
@@ -362,7 +562,7 @@ private:
 			{
 				DWORD dwErr = GetLastError();
 				// 显示一下提示信息
-				// 如果是超时了，就再继续等吧  
+				// 如果是超时了，就再继续等
 				if (WAIT_TIMEOUT == dwErr)
 				{
 					// 确认客户端是否还活着...
@@ -372,7 +572,7 @@ private:
 						_DeleteSocket(pEvent);
 					}
 				}
-				// 可能是客户端异常退出了
+				// 可能是客户端异常退出
 				else if (ERROR_NETNAME_DELETED == dwErr)
 				{
 					//printf("检测到客户端异常退出！\n");
@@ -441,6 +641,7 @@ private:
 
 	}
 };
+#endif
 #endif
 
 
