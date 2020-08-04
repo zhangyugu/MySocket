@@ -1,13 +1,11 @@
-﻿#ifndef EPOLL_HPP
-#define EPOLL_HPP
-
-#include <iostream>
-#include <functional>//泛函数 std::mum_fn
-#if __linux__
-#define EPOLL_ERROR (-1)
+﻿#ifndef CELL_EPOLL_HPP
+#define CELL_EPOLL_HPP
 #include <sys/epoll.h>
 #include <fcntl.h>
-class Epoll
+#include <iostream>
+#include <functional>//泛函数 std::mum_fn
+
+class CellEpoll
 {
 private:
 	typedef std::function<void(int)> Handle;
@@ -16,16 +14,15 @@ private:
 	bool _isNormal;//是否正常
 	const int _MaxEvents;
 public:
-	Epoll(int maxevents = 1024) : _events(nullptr), _epoll_fd(-1), _isNormal(false), _MaxEvents(maxevents)
+	CellEpoll(int maxevents = 1024) : _events(nullptr), _epoll_fd(-1), _isNormal(false), _MaxEvents(maxevents)
 	{
 		//printf("最大监听数: %d\n", _MaxEvents);
 		create();
 	}
-	~Epoll()
+	~CellEpoll()
 	{
 		if (_events)
 			free(_events);
-		close(_epoll_fd);
 	}
 	
 	bool isNormal()
@@ -33,11 +30,11 @@ public:
 		return _isNormal;
 	}
 	// 注册新描述符
-	int add(int fd, void* data, int events = EPOLLIN | EPOLLET) {
+	int add(int fd, int events = EPOLLIN | EPOLLET) {
 		if (_isNormal)
 		{
 			make_socket_non_blocking(fd);
-			_event.data.ptr = data;
+			_event.data.fd = fd;
 			_event.events = events;
 			return epoll_ctl(_epoll_fd, EPOLL_CTL_ADD, fd, &_event);			
 		}
@@ -50,10 +47,10 @@ public:
 	}
 
 	// 修改描述符状态
-	int tk_epoll_mod(int fd, void* data, int events) {
+	int tk_epoll_mod(int fd, int events) {
 		if (_isNormal)
 		{		
-			_event.data.ptr = data;
+			_event.data.fd = fd;
 			_event.events = events;
 			return epoll_ctl(_epoll_fd, EPOLL_CTL_MOD, fd, &_event);
 		}
@@ -61,10 +58,10 @@ public:
 	}
 
 	// 从epoll中删除描述符
-	int del(int fd, void* data,int events = EPOLLIN | EPOLLET) {
+	int del(int fd, int events = EPOLLIN | EPOLLET) {
 		if (_isNormal)
 		{
-			_event.data.ptr = data;
+			_event.data.fd = fd;
 			_event.events = events;
 			return epoll_ctl(_epoll_fd, EPOLL_CTL_DEL, fd, &_event);
 			
@@ -73,45 +70,41 @@ public:
 	}
 
 	// 返回活跃事件数
-	int wait(int timeout)
-	{
+	int wait(int timeout, Handle read = nullptr, Handle write = nullptr) {
 		if (_isNormal)
 		{
-			return epoll_wait(_epoll_fd, _events, _MaxEvents, timeout);
-			/*if (num < 0)
-				return -1;*/
-			//for (int i = 0; i < num; ++i)
-			//{
-			//	if (_events[i].events & EPOLLIN)
-			//	{					
-			//		if (read)
-			//			read(_events[i].data.fd);
+			int num = epoll_wait(_epoll_fd, _events, _MaxEvents, timeout);
+			if (num < 0)
+				return -1;
+			for (int i = 0; i < num; ++i)
+			{
+				if (_events[i].events & EPOLLIN)
+				{					
+					if (read)
+						read(_events[i].data.fd);
 
-			//		//修改sockfd_r上要处理的事件为EPOLLOUT
-			//		_event.data.fd = _events[i].data.fd;
-			//		_event.events = EPOLLOUT | EPOLLET;
-			//		epoll_ctl(_epoll_fd, EPOLL_CTL_MOD, _events[i].data.fd, &_event);
-			//	}
-			//	else if (_events[i].events & EPOLLOUT)
-			//	{
-			//		if (write)
-			//			write(_events[i].data.fd);
-			//		//修改sockfd_w上要处理的事件为EPOLLIN
-			//		_event.data.fd = _events[i].data.fd;
-			//		_event.events = EPOLLIN | EPOLLET;
-			//		epoll_ctl(_epoll_fd, EPOLL_CTL_MOD, _events[i].data.fd, &_event);
-			//	}
-			//}
-			//return num;
+					//修改sockfd_r上要处理的事件为EPOLLOUT
+					_event.data.fd = _events[i].data.fd;
+					_event.events = EPOLLOUT | EPOLLET;
+					epoll_ctl(_epoll_fd, EPOLL_CTL_MOD, _events[i].data.fd, &_event);
+				}
+				else if (_events[i].events & EPOLLOUT)
+				{
+					if (write)
+						write(_events[i].data.fd);
+					//修改sockfd_w上要处理的事件为EPOLLIN
+					_event.data.fd = _events[i].data.fd;
+					_event.events = EPOLLIN | EPOLLET;
+					epoll_ctl(_epoll_fd, EPOLL_CTL_MOD, _events[i].data.fd, &_event);
+				}
+			}
+			return num;
 		}
 		else return -1;
 		
 
 	}
-	epoll_event* events()
-	{
-		return _events;
-	}
+
 	//// 分发处理函数
 	//void tk_handle_events(int epoll_fd, int listen_fd, 
 	//	int events_num, char* path) {
@@ -171,5 +164,5 @@ private:
 
 
 
-#endif //__linux__
+
 #endif // !CELL_EPOLL_HPP

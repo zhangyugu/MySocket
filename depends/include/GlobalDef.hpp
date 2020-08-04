@@ -8,7 +8,7 @@
 #define CLIENT_HREAT_DEAD_TIME 60000 //心跳检测死亡计时时间(毫秒)
 #define RECV_BUFF_SIZE 8192//10240//缓冲区大小
 #define SEND_BUFF_SIZE RECV_BUFF_SIZE
-#include "SockContext.hpp"
+#include "SockContext.h"
 #include "CELLTimestamp.hpp"//时钟
 #include "Log.hpp"
 

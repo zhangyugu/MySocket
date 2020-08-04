@@ -1,85 +1,44 @@
-#ifndef EASY_TCP_SERVER_HPP
+﻿#ifndef EASY_TCP_SERVER_HPP
 #define EASY_TCP_SERVER_HPP
 #include "GlobalDef.hpp"
 #include"CellServer.hpp"
-#include "SockContext.hpp"
+#include "SockContext.h"
+
 
 class EasyTcpServer: public INetEvent
 {
 private:
-	CellThread _therad;
-	std::vector<std::shared_ptr<CellServer>> _vce_pcellserver;
-	CELLTimestamp _rTime;
-	std::mutex _mutex;
+	CellThread _therad;//主线程  任务: 接收客户端连接
+	std::vector<std::shared_ptr<CellServer>> _vce_pcellserver;//副线程组 任务: 处理消息、发送消息
+	SOCKET _sock = INVALID_SOCKET;//主套接字
+	fd_set _fdRead{};//可读套接字描述符
+	fd_set _fdWrite{};//可写套接字描述符
+	fd_set _fdExp{};//错误套接字描述符
+	CELLTimestamp _rTime;//计时
+#ifdef _WIN32
+	IOCP _iocpListen;
+#endif
 protected:
-	SOCKET _sock;
-	std::atomic_int _OnConut;//消息计数
-	std::atomic_int _OnRevc;//接收计数
-	std::atomic_int _clientCount;//客户计数
-protected:
-	//等待客户连接
-	virtual bool OnRun(CellThread *pthread) = 0;
+	std::atomic_int _OnConut{};//消息计数
+	std::atomic_int _OnRevc{};//接收计数
+	std::atomic_int _clientCount{};//客户计数
+	std::mutex _mutex;//线程锁
 public:
-	EasyTcpServer(): _sock(INVALID_SOCKET), _OnConut(0), _clientCount(0), _OnRevc(0)
+	EasyTcpServer()
 	{	
-		initSocket();
+		
 	}
 	virtual ~EasyTcpServer()
 	{
 		Close();
 	}
-	//3 listen 监听网络端口
-	bool Listen(int i = 5)
-	{
-		if (SOCKET_ERROR == listen(_sock, i))
-		{
-			Log::Info("错误, <_sock=%d>监听端口失败...\n",_sock);
-			return false;
-		}
-
-		Log::Info("监听成功<_sock=%d>等待客户端加入...\n", _sock);
-		return true;
-	}
-	//2 bind 绑定用于接收客户端连接的网络端口
-	bool BindPort(unsigned short post, unsigned short family = AF_INET, const char* addr = nullptr)
-	{
-		if (INVALID_SOCKET == _sock)//未启动
-		{
-			if (!initSocket())
-			{
-				return false;
-			}
-		}
-
-		sockaddr_in _sin = {};
-		_sin.sin_family = family;//地址规范  IPv4 IPv6
-		_sin.sin_port = htons(post);//端口   由于不同系统的USHORT字节长度不同, 需要统一转换
-		auto ip = addr ? inet_addr(addr) : INADDR_ANY;
-#ifdef _WIN32
-		_sin.sin_addr.S_un.S_addr = ip;//绑定本机ip地址  INADDR_ANY 本机的全部地址  //inet_addr("127.0.0.1");
-#else
-		_sin.sin_addr.s_addr = ip;
-#endif
-		if (SOCKET_ERROR == bind(_sock, (sockaddr*)&_sin, sizeof(sockaddr_in)))
-		{
-			//端口被占用
-			Log::Info("错误, 绑定端口<post=%d>失败...\n", post);
-			return false;
-		}
-
-		return true;
-	}
-
-	template<typename Server>
-	void Start(int TCount = 1)
-	{
-		if (TCount < 1)
-			TCount = 1;
-
-		for (int i = 0; i < TCount; ++i)
+		
+	void Start()
+	{		
+		for (int i = 0; i < /*std::thread::hardware_concurrency()*/1; ++i)
 		{
 			//创建处理对象
-			auto tmp = new Server(this);
+			auto tmp = new CellServer(this);
 			if (tmp)
 			{
 				_vce_pcellserver.push_back(std::shared_ptr<CellServer>(tmp));
@@ -88,7 +47,8 @@ public:
 			}
 		}
 
-		_therad.Start([this](CellThread *pthread) { OnRun(pthread); });
+		//_therad.Start([this](CellThread *pthread) { OnRunLoop(pthread); });
+
 	}
 	//9 关闭
 	void Close()
@@ -103,46 +63,170 @@ public:
 		}
 	}
 
-private:
 	//初始化 1 建立一个 socket 套接字
-	bool initSocket()
+	bool CreateListenSocket(unsigned short post, int i = 1024, const char* addr = nullptr)
 	{
 		SockContext::Instance();
+
+#ifdef _WIN32
+		return _iocpListen.CreateListenSocket([this](SOCKET &socket, sockaddr_in &addr) {
+			ClientInfo* client = new ClientInfo;//客户端传进来的套接字	
+			if (client == nullptr)
+			{
+				Log::Info("error, Unable to allocate memory for client...\n");
+				return;
+			}
+			client->_socket = socket;
+			memcpy(&client->_addr, &addr, sizeof(sockaddr_in));
+			if (!addClient(client))
+				delete client;
+
+		}, post, i);
+#else
+
 		//--用 Socket API 建立简易的TCP服务端
 		if (INVALID_SOCKET != _sock)
 			CloseSock(_sock);
 
-		 _sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);//地址规范, 类型, 协议
-		 if (INVALID_SOCKET == _sock)
-		 {
-			 Log::Info("错误, 建立套接字失败...\n");
-			 return false;
-		 }
+		_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);//地址规范, 类型, 协议
+		if (INVALID_SOCKET == _sock)
+		{
+			Log::Info("error, Failed to establish socket...\n");
+			return false;
+		}
 
-		 return true;
+		sockaddr_in _sin = {};
+		_sin.sin_family = AF_INET;//地址规范  IPv4 IPv6
+		_sin.sin_port = htons(post);//端口   由于不同系统的USHORT字节长度不同, 需要统一转换
+		auto ip = addr ? inet_addr(addr) : INADDR_ANY;
+#ifdef _WIN32
+		_sin.sin_addr.S_un.S_addr = ip;//绑定本机ip地址  INADDR_ANY 本机的全部地址  //inet_addr("127.0.0.1");
+#else
+		_sin.sin_addr.s_addr = ip;
+#endif
+		if (SOCKET_ERROR == bind(_sock, (sockaddr*)&_sin, sizeof(sockaddr_in)))
+		{
+			//端口被占用
+			Log::Info("error, post<%d> bind failed...\n", post);
+			return false;
+		}
+		if (SOCKET_ERROR == listen(_sock, i))
+		{
+			Log::Info("error, socket<%d> listen failed...\n", _sock);
+			return false;
+		}
+
+		Log::Info("listen socket<%d> success, Wait for the client to join...\n", _sock);
+#endif
+		
+
+		//#ifndef _WIN32
+		//		 make_socket_non_blocking(_sock);
+		//#endif
+		return true;
+	}
+	
+
+private:
+	//accept 等待接受客户端连接
+	bool Accept()
+	{
+		
+		if (_clientCount <= _vce_pcellserver.size() * MAX_CLIENT)
+		{
+			ClientInfo* client = new ClientInfo;//客户端传进来的套接字
+			if (client == nullptr)
+			{
+				Log::Info("error, Unable to allocate memory for client...\n");
+				return false;
+			}
+#ifdef _WIN32
+			int clientlen = sizeof(sockaddr_in);//客户端传进来的套接字的长度
+#else
+			unsigned int clientlen = sizeof(sockaddr_in);//客户端传进来的套接字的长度
+#endif
+			client->_socket = accept(_sock, (sockaddr*)&client->_addr, &clientlen);
+			if (INVALID_SOCKET == client->_socket)
+			{
+				Log::Info("error, Invalid client socket received...\n");
+				delete client;
+				return false;
+			}
+			//IP = inet_ntoa(client->addr.sin_addr) ;
+	//#ifndef _WIN32
+	//		make_socket_non_blocking(client->sock);
+	//		client->_event.data.fd = client->sock;
+	//		client->_event.events = EPOLLIN | EPOLLOUT | EPOLLET | EPOLLONESHOT;
+	//#endif // !_WIN32
+
+			//添加新的客户端
+			addClient(client);		
+			return true;
+		}
+		return false;
 	}
 
-	
+
 	//添加客户端到CellServer
 	bool addClient(ClientInfo* pClient)
 	{
-		if (pClient == nullptr)
-			return false;
+		if (pClient && !_vce_pcellserver.empty())
+		{				
+			pClient->_dtconnect_login = CELLTime::getNowinMilliSec();//连接时间
+			//保存到数量最少的线程
+			auto MaxSize = _vce_pcellserver.front();
+			for (auto &x : _vce_pcellserver)
+			{
+				if (MaxSize->getClientCount() > x->getClientCount())
+					MaxSize = x;
+			}
 
-		//保存到数量最少的线程
-		auto MaxSize = _vce_pcellserver.front();
-		for (auto &x : _vce_pcellserver)
-		{
-			if (MaxSize->getClientCount() > x->getClientCount())
-				MaxSize = x;
+			MaxSize->addClient(pClient);
+			
+		
+			return true;
 		}
-
-		MaxSize->addClient(pClient);
-
-		return true;
+		else
+			return false;
 	}
 
-	
+	//等待客户连接
+	bool OnRunLoop(CellThread *pthread)
+	{
+		while (pthread->isRun())
+		{
+			calcRecv();
+			FD_ZERO(&_fdRead);//清空
+			FD_SET(_sock, &_fdRead);//设置
+		
+			//nfds 是一个整数值, 是指fd_set集合中所有描述符(socket)的范围,
+			//而不是数量.既是所有文件描述符中最大值+1, 再windows中这个参数可以写0
+			//timeout为NULL时无限等待事件产生
+			timeval timeout = { 0,1000 };
+			int ret = select((int)_sock + 1, &_fdRead, nullptr, nullptr, &timeout);
+			if (ret < 0)
+			{
+				Log::Info("TcpServer.OnRunLoop.select Error!\n");
+				break;
+			}
+			else if (ret == 0)
+				continue;
+#ifdef _WIN32
+			if (_sock == *_fdRead.fd_array)//检查
+#else
+			if (FD_ISSET(_sock, &_fdRead))//检查
+#endif
+			{
+				//FD_CLR(_sock, &_fdRead);//删除
+				Accept();//接受客户端连接
+				
+			}
+		}
+		
+		
+
+		return false;
+	}
 
 	//关闭Sock
 	inline void CloseSock(SOCKET &sock)
@@ -156,38 +240,6 @@ private:
 		sock = INVALID_SOCKET;
 	}
 
-	
-protected:
-	//accept 等待接受客户端连接
-	bool Accept()
-	{
-
-		ClientInfo* client = new ClientInfo;//客户端传进来的套接字
-		if (client == nullptr)
-		{
-			Log::Info("错误, 无法为客户端分配内存...\n");
-			return false;
-		}
-#ifdef _WIN32
-		int clientlen = sizeof(sockaddr_in);//客户端传进来的套接字的长度
-#else
-		unsigned int clientlen = sizeof(sockaddr_in);//客户端传进来的套接字的长度
-#endif
-		client->_socket = accept(_sock, (sockaddr*)&client->addr, &clientlen);
-		if (INVALID_SOCKET == client->_socket)
-		{
-			Log::Info("错误, 接受到无效客户端套接字...\n");
-			delete client;
-			return false;
-		}
-
-		//IP = inet_ntoa(client->addr.sin_addr) ;
-
-		//添加新的客户端
-		addClient(client);
-
-		return true;
-	}
 	bool calcRecv()
 	{
 		if (_clientCount <= 0)
@@ -208,9 +260,9 @@ protected:
 		}
 		return true;
 	}
+protected:
 	//只被一个线程调用  称为线程安全函数
 	// 被多个线程调用   称为线程不安全函数
-
 	virtual void OnNetLeave(ClientInfo* pClient)
 	{
 		//执行处理
